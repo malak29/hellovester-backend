@@ -1,0 +1,146 @@
+import os
+import psycopg2
+import traceback
+import requests
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from pgvector.psycopg2 import register_vector
+import openai
+from diagram_generator import is_process_query
+from fastapi.middleware.cors import CORSMiddleware
+
+# Initialize FastAPI app
+app = FastAPI()
+# Allow all origins (you can restrict this for production)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (GET, POST, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
+
+# ✅ PostgreSQL Connection Setup
+def get_db_connection():
+    try:
+        conn = psycopg2.connect(
+            dbname="hellovester",
+            user="malak",
+            password="postgres",
+            host="localhost",
+            port="5432"
+        )
+        register_vector(conn)  # Enable vector search
+        return conn
+    except psycopg2.OperationalError as e:
+        print(f"Database connection error: {e}")
+        raise HTTPException(status_code=500, detail="Database connection error")
+
+# ✅ API Route: Convert Query to OpenAI Embedding
+def get_embedding(text: str):
+    try:
+        # Call OpenAI API for text embeddings
+        text = text.replace("\n", " ")
+        response = openai.embeddings.create(
+            model="text-embedding-ada-002",  # Embedding model provided by OpenAI
+            input=[text]
+        )
+        embedding = response.data[0].embedding  # Correctly access the embedding list
+        return embedding  
+    except Exception as e:
+        print(f"OpenAI API error: {e}")
+        raise HTTPException(status_code=500, detail="OpenAI API error")
+
+# ✅ Define a Pydantic model for input request
+class QueryRequest(BaseModel):
+    query: str
+
+# ✅ API Route: Search Cryptocurrency Knowledge Base
+@app.get("/search/")
+def search_crypto(query: str, top_k: int = 5):
+    try:
+        query_embedding = get_embedding(query)  # Get embedding from OpenAI API
+        conn = get_db_connection()
+        cursor = conn.cursor()
+
+        # 🔎 Vector similarity search using pgvector
+        cursor.execute(
+            "SELECT url, content FROM crypto_embeddings ORDER BY embedding <-> %s::vector LIMIT %s;",
+            (query_embedding, top_k)
+        )
+
+        results = cursor.fetchall()
+        cursor.close()
+        conn.close()
+
+        return {"results": [{"url": row[0], "content": row[1]} for row in results]}
+    
+    except psycopg2.Error as e:
+        print(f"PostgreSQL error: {e}")
+        raise HTTPException(status_code=500, detail="PostgreSQL error")
+    
+    except Exception as e:
+        print(f"Unexpected error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Unexpected error during search")
+    
+# Function to query OpenAI for breaking down the query into steps
+def generate_steps_from_openai(query: str) -> list:
+    """
+    Uses OpenAI to generate a list of steps from a given query.
+    """
+    prompt = f"Break down the following query response into concise steps, each having 5 to 8 words: {query}"
+    
+    try:
+        response = openai.chat.completions.create(
+            model="gpt-4",  # Using GPT-4 for this example
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=100,  # Limit the token count for brevity
+            temperature=0.5,  # Set to control creativity
+            n=1  # Only one response
+        )
+        print(response)
+        # Correctly access the message content
+        steps = response.choices[0].message.content.strip().split("\n")
+        
+        # Clean and filter steps
+        return [step.strip() for step in steps if step.strip()]
+    
+    except Exception as e:
+        print(f"OpenAI API error: {e}")
+        raise HTTPException(status_code=500, detail="OpenAI API error")
+
+@app.post("/get_response/")
+async def get_response(request: QueryRequest):
+    try:
+        query_embedding = get_embedding(request.query)  # Get embedding from OpenAI API
+        conn = get_db_connection()
+        cur = conn.cursor()
+
+        # Query crypto embeddings for best matches
+        cur.execute("SELECT file_name, content FROM pdf_embeddings ORDER BY embedding <-> %s::vector LIMIT 5;", (query_embedding,))
+
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # Generate steps using OpenAI if the query involves a process
+        steps = []
+        if is_process_query(request.query):
+            steps = generate_steps_from_openai(request.query)  # Get steps directly from OpenAI
+
+        return {
+            "query": request.query,
+            "results": [{"source": r[0], "content": r[1]} for r in results],
+            "steps": steps  # Return steps generated by OpenAI
+        }
+
+    except psycopg2.Error as e:
+        print(f"PostgreSQL error: {e}")
+        raise HTTPException(status_code=500, detail="PostgreSQL error")
+    
+    except Exception as e:
+        print(f"Unexpected error: {traceback.format_exc()}")
+        raise HTTPException(status_code=500, detail="Unexpected error during search")
